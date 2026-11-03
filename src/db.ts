@@ -11,6 +11,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { rmSync, writeFileSync } from 'node:fs';
 import { open, readFile, readdir, rename, rm, stat, type FileHandle } from 'node:fs/promises';
 import nodePath from 'node:path';
 
@@ -54,6 +55,116 @@ export interface ReaderConnection {
  * Defaults to a read-only `node:sqlite` connection.
  */
 export type OpenReader = (path: string) => ReaderConnection;
+
+/**
+ * CheckpointConnection is the minimal read-write SQLite connection used by
+ * {@link runCheckpoint} to run `PRAGMA wal_checkpoint`. A
+ * `node:sqlite` `DatabaseSync` satisfies it. It must not have an open
+ * transaction.
+ */
+export interface CheckpointConnection {
+  prepare(sql: string): { get(): unknown };
+}
+
+/**
+ * CheckpointMode is a `wal_checkpoint` mode that resets the WAL. Both modes
+ * guarantee that the next write starts a new WAL; `TRUNCATE` also truncates
+ * the `-wal` file to zero bytes.
+ */
+export type CheckpointMode = 'RESTART' | 'TRUNCATE';
+
+/**
+ * CheckpointToken describes the position of the last sync, for
+ * {@link runCheckpoint}. It is plain JSON, so it can be sent to the thread or
+ * process that owns the writing connection.
+ */
+export interface CheckpointToken {
+  /** Path of the database. */
+  path: string;
+  /** Local TXID of the last sync, as a decimal string. */
+  txid: string;
+  /** WAL salts recorded by the last sync. */
+  salt1: number;
+  salt2: number;
+  /**
+   * Number of WAL frames the last sync covered; 0 when it does not cover a
+   * known WAL, in which case the checkpoint cannot keep the next sync
+   * incremental.
+   */
+  frames: number;
+}
+
+/**
+ * The record left by a checkpoint that reset the WAL right after a sync: the
+ * next WAL (the one with `nextSalt1`) holds only changes on top of `txid`.
+ */
+interface CheckpointRecord {
+  txid: bigint;
+  salt1: number;
+  salt2: number;
+  nextSalt1: number;
+}
+
+/** Path of the checkpoint record of the database at `path`. */
+function checkpointRecordPath(path: string): string {
+  return nodePath.join(`${path}-litestream`, 'checkpoint');
+}
+
+/**
+ * RunCheckpoint checkpoints the WAL of `token.path` with `mode` through `conn`,
+ * the connection that writes the database (with no open transaction), and,
+ * if the WAL held exactly the frames of the sync described by `token`,
+ * records that the next WAL continues from it. Returns whether it recorded it.
+ *
+ * It is synchronous, so no write on the calling thread can land between the
+ * checkpoint and the record. No sync of the database may run between the
+ * call that produced `token` and this one.
+ *
+ * The checkpoint runs as `RESTART` first: its `log` column (the number of
+ * frames in the WAL) proves that no commit landed between the sync and the
+ * checkpoint, and a complete `RESTART` guarantees that the next write starts
+ * a new WAL. SQLite gives that WAL the old salt-1 plus one when the connection
+ * that starts it has reset the WAL before (as `conn` just did); the next sync
+ * accepts the new WAL only with that salt-1. Any other reset (another
+ * checkpoint, or a WAL started by a different connection, which picks random
+ * salts) falls back to a snapshot. `TRUNCATE` then truncates the `-wal` file.
+ */
+export function runCheckpoint(
+  conn: CheckpointConnection,
+  token: CheckpointToken,
+  mode: CheckpointMode = 'TRUNCATE',
+): boolean {
+  if (mode !== 'RESTART' && mode !== 'TRUNCATE') {
+    throw new DatabaseError(`unsupported checkpoint mode: ${mode}`);
+  }
+  const recordPath = checkpointRecordPath(token.path);
+  rmSync(recordPath, { force: true });
+
+  const r = conn.prepare('PRAGMA wal_checkpoint(RESTART)').get() as {
+    busy: number;
+    log: number;
+    checkpointed: number;
+  };
+  const complete =
+    token.frames > 0 && r.busy === 0 && r.log === token.frames && r.checkpointed === token.frames;
+
+  if (complete) {
+    const record = {
+      txid: token.txid,
+      salt1: token.salt1,
+      salt2: token.salt2,
+      nextSalt1: (token.salt1 + 1) >>> 0,
+    };
+    writeFileSync(recordPath, `${JSON.stringify(record)}\n`);
+  }
+
+  if (mode === 'TRUNCATE') {
+    // Whatever the outcome, the next WAL is the one recorded above (or a
+    // later one, which falls back to a snapshot).
+    conn.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+  }
+  return complete;
+}
 
 function defaultOpenReader(path: string): ReaderConnection {
   return new DatabaseSync(path, { readOnly: true });
@@ -127,6 +238,24 @@ export class LocalDatabase {
       return BigInt((await readFile(this.baseTXIDPath(), 'utf8')).trim());
     } catch {
       return 0n;
+    }
+  }
+
+  /**
+   * CheckpointPath returns the path of the file recording that a checkpoint
+   * reset the WAL right after a sync (see {@link runCheckpoint}).
+   */
+  checkpointPath(): string {
+    return checkpointRecordPath(this.path);
+  }
+
+  /** Returns the checkpoint record, or null if there is none. */
+  private async checkpointRecord(): Promise<CheckpointRecord | null> {
+    try {
+      const r = JSON.parse(await readFile(this.checkpointPath(), 'utf8'));
+      return { txid: BigInt(r.txid), salt1: r.salt1, salt2: r.salt2, nextSalt1: r.nextSalt1 };
+    } catch {
+      return null;
     }
   }
 
@@ -257,7 +386,7 @@ export class LocalDatabase {
       const walBuf = await this.readWalOrEmpty();
 
       // Determine the previous sync state to resume incremental reading.
-      const prev = await this.prevSyncInfo();
+      let prev = await this.prevSyncInfo();
       let snapshotting = prev === null;
 
       let reader: WALReader | null = null;
@@ -271,6 +400,16 @@ export class LocalDatabase {
 
       if (!snapshotting && prev !== null) {
         reader = makeResumeReader(walBuf, prev.walOffset + prev.walSize, prev.salt1, prev.salt2);
+        if (reader === null && (await this.checkpointed(pos, prev))) {
+          // The WAL was reset by runCheckpoint() right after the previous sync:
+          // the database file holds the state at `pos`, and every frame of the
+          // new WAL is a change on top of it.
+          if (walBuf.length < WALHeaderSize) return null; // no new WAL yet
+          reader = makeNextReader(walBuf, (await this.checkpointRecord())!.nextSalt1);
+          if (reader !== null) {
+            prev = { ...prev, walOffset: WALHeaderSize, walSize: 0, salt1: reader.salt1(), salt2: reader.salt2() };
+          }
+        }
         if (reader === null) {
           snapshotting = true; // WAL was reset; fall back to a snapshot base
         } else {
@@ -293,18 +432,18 @@ export class LocalDatabase {
 
       if (snapshotting) {
         // Read the WAL from the start to build a full page map for the snapshot.
+        offset = WALHeaderSize;
+        maxOffset = 0;
         try {
           const full = new WALReader(walBuf);
           const pm = full.pageMap();
           pageMap = pm.pageIndex;
           walCommit = pm.commit;
+          maxOffset = pm.maxOffset;
           salt1 = full.salt1();
           salt2 = full.salt2();
         } catch (err) {
           if (!(err instanceof WALEOFError)) throw err;
-        }
-        if (walCommit > 0) {
-          offset = WALHeaderSize;
         }
       }
 
@@ -330,7 +469,9 @@ export class LocalDatabase {
         timestamp: BigInt(Date.now()),
         preApplyChecksum: 0n,
         walOffset: BigInt(offset),
-        walSize: BigInt(snapshotting ? Math.max(0, walBuf.length - WALHeaderSize) : walSize),
+        // A snapshot covers the WAL up to its last commit frame, so the next
+        // sync resumes right after it (not after uncommitted frames).
+        walSize: BigInt(snapshotting ? (maxOffset > 0 ? maxOffset - WALHeaderSize : 0) : walSize),
         walSalt1: salt1,
         walSalt2: salt2,
         nodeID: 0n,
@@ -411,6 +552,39 @@ export class LocalDatabase {
       }
       enc.encodePage({ pgno, flags: 0 }, await this.readPage(pgno, pageSize, pageMap, walBuf, dbHandle));
     }
+  }
+
+  /**
+   * CheckpointToken describes the position of the last sync for
+   * {@link runCheckpoint}. The caller must have synced first. It reads the
+   * local cache only, so it can be called from a different thread than the
+   * one running the checkpoint.
+   */
+  async checkpointToken(): Promise<CheckpointToken> {
+    const pos = await this.pos();
+    const prev = await this.prevSyncInfo();
+    // The frames the last sync covered, all in the WAL with prev's salts.
+    const end = prev === null ? 0 : prev.walOffset + prev.walSize;
+    const frames = (end - WALHeaderSize) / (this.pageSize + WALFrameHeaderSize);
+    return {
+      path: this.path,
+      txid: String(pos),
+      salt1: prev?.salt1 ?? 0,
+      salt2: prev?.salt2 ?? 0,
+      frames: prev !== null && end > WALHeaderSize && Number.isInteger(frames) ? frames : 0,
+    };
+  }
+
+  /**
+   * Reports whether the WAL was reset by {@link runCheckpoint} right after the
+   * sync that wrote the file at `pos` described by `prev`.
+   */
+  private async checkpointed(
+    pos: bigint,
+    prev: { salt1: number; salt2: number },
+  ): Promise<boolean> {
+    const r = await this.checkpointRecord();
+    return r !== null && r.txid === pos && r.salt1 === prev.salt1 && r.salt2 === prev.salt2;
   }
 
   /**
@@ -585,9 +759,28 @@ function makeResumeReader(walBuf: Uint8Array, offset: number, salt1: number, sal
     }
   }
   try {
+    // A WAL restarted since the last sync has new salts in its header, even if
+    // frames of the old WAL are still on disk past the new ones.
+    const hdr = new WALReader(walBuf);
+    if (hdr.salt1() !== salt1 || hdr.salt2() !== salt2) return null;
     return WALReader.withOffset(walBuf, offset, salt1, salt2);
   } catch (err) {
-    if (err instanceof PrevFrameMismatchError) return null;
+    if (err instanceof PrevFrameMismatchError || err instanceof WALEOFError) return null;
+    throw err;
+  }
+}
+
+/**
+ * Creates a WALReader from the start of a WAL restarted by a checkpoint, or
+ * null if the WAL is not the one that directly followed it (salt-1 is
+ * incremented by one on every restart).
+ */
+function makeNextReader(walBuf: Uint8Array, nextSalt1: number): WALReader | null {
+  try {
+    const r = new WALReader(walBuf);
+    return r.salt1() === nextSalt1 ? r : null;
+  } catch (err) {
+    if (err instanceof WALEOFError) return null;
     throw err;
   }
 }
